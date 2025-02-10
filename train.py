@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import torch
 import torchvision.transforms as transforms
+from torch.utils.tensorboard import SummaryWriter
 
 HP, WP, P = 27, 27, 14
 
@@ -50,6 +51,7 @@ def pairwise_ranking_loss_vectorized(pred, margin=1.0):
 
 def main(n_epochs=1, seed=0, device="cpu"):
     torch.manual_seed(seed)
+    writer = SummaryWriter()
     ds = Sentinel2Dataset()
     dl = torch.utils.data.DataLoader(ds, batch_size=4, shuffle=True)
     normalize = transforms.Normalize(
@@ -71,7 +73,7 @@ def main(n_epochs=1, seed=0, device="cpu"):
     )
     times = {}
     for epoch in range(n_epochs):
-        for batch in tqdm.tqdm(dl, total=len(dl)):
+        for batch_idx, batch in enumerate(tqdm.tqdm(dl, total=len(dl))):
             batch = batch.to(device, non_blocking=True)
             batch = normalize(batch / 255.0)
             B, T, C, H, W = batch.shape
@@ -105,7 +107,15 @@ def main(n_epochs=1, seed=0, device="cpu"):
             optim.step()
             times["optim"] = time.time() - st
             # log
+            writer.add_scalar("Loss/train", loss.item(), epoch * len(dl) + batch_idx)
+            writer.add_scalars("times", times, epoch * len(dl) + batch_idx)
             print(loss.item(), times)
+    writer.close()
+
+    # save model
+    torch.save(transformer_layer.state_dict(), os.path.join(writer.log_dir, "transformer_layer.pth"))
+    torch.save(linear_layer.state_dict(), os.path.join(writer.log_dir, "linear_layer.pth"))
+
 
 
 def visualize_sample(number):
