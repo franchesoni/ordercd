@@ -6,8 +6,10 @@ import numpy as np
 import torch
 import torchvision.transforms as transforms
 from torch.utils.tensorboard import SummaryWriter
+from cadamw import AdamW
 
 HP, WP, P = 27, 27, 14
+
 
 class Sentinel2Dataset(torch.utils.data.Dataset):
     def __init__(self, root="data/sentinel_2"):
@@ -20,7 +22,7 @@ class Sentinel2Dataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         sample_path = os.path.join(self.root, self.samples[idx])
         sample = np.load(sample_path)[:, :, : P * HP, : P * WP]
-        sample = sample[np.array([0,1,9])]  # take first, second and last
+        sample = sample[np.array([0, 1, 9])]  # take first, second and last
         return sample
 
 
@@ -50,11 +52,11 @@ def pairwise_ranking_loss_vectorized(pred, margin=1.0):
     return loss
 
 
-def main(n_epochs=1, seed=0, device="cpu"):
+def main(n_epochs=1, seed=0, device="cuda:1", batch_size=4):
     torch.manual_seed(seed)
-    writer = SummaryWriter()
+    writer = SummaryWriter(comment="binary")
     ds = Sentinel2Dataset()
-    dl = torch.utils.data.DataLoader(ds, batch_size=4, shuffle=True)
+    dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=24, drop_last=True)
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
     )
@@ -69,12 +71,17 @@ def main(n_epochs=1, seed=0, device="cpu"):
     transformer_layer.to(device)
     linear_layer.to(device)
 
-    optim = torch.optim.Adam(
-        list(transformer_layer.parameters()) + list(linear_layer.parameters()), lr=1e-4
+    optim = AdamW(
+        list(transformer_layer.parameters()) + list(linear_layer.parameters()), lr=1e-3
     )
     times = {}
+    ground_truth = (
+        torch.cat([torch.zeros(batch_size), torch.ones(batch_size)], dim=0)
+        .view(-1, 1)
+        .to(device)
+    )  # zero for the first diff, 1 for the last diff
     for epoch in range(n_epochs):
-        for batch_idx, batch in enumerate(tqdm.tqdm(dl, total=len(dl))):
+        for batch_idx, batch in enumerate(tqdm.tqdm(dl, total=len(dl), disable=False)):
             batch = batch.to(device, non_blocking=True)
             batch = normalize(batch / 255.0)
             B, T, C, H, W = batch.shape
@@ -83,24 +90,27 @@ def main(n_epochs=1, seed=0, device="cpu"):
                 x = backbone.forward_features(batch.view(B * T, C, H, W))[
                     "x_norm_patchtokens"
                 ].view(B, T, HP, WP, 384)
-                x = x.unsqueeze(2) - x.unsqueeze(
-                    1
-                )  # B, T, T, HP, WP, 384, where dim 1 is i, dim 2 is j, and it contains feat[i] - feat[j]
+                x_first, x_last = (
+                    x[:, 1] - x[:, 0],
+                    x[:, -1] - x[:, 0],
+                )  # (B, HP, WP, 384)
             times["backbone"] = time.time() - st
             st = time.time()
             x = transformer_layer(
-                x.view(B * T * T, HP * WP, 384)
-            )  # (BTT, HPWP, 384),  these are "local change features"
+                torch.concatenate([x_first, x_last], dim=0).view(2 * B, HP * WP, 384)
+            )  # (2B, HPWP, 384),  these are "local change features"
             x = x.mean(
                 dim=1
-            )  # average pool over HPWP, (BTT, 384), these are "global change features"
-            change_score = torch.sigmoid(
-                linear_layer(x).view(B, T, T)
-            )  # these are "distances"
+            )  # average pool over HPWP, (2B, 384), these are "global change features"
+            change_score = linear_layer(x).view(
+                2 * B, 1
+            )  # these are the change scores for each pair
             times["head"] = time.time() - st
             # optim step
             st = time.time()
-            loss = pairwise_ranking_loss_vectorized(change_score, margin=0.01)
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                change_score, target=ground_truth
+            )
             times["loss"] = time.time() - st
             st = time.time()
             optim.zero_grad()
@@ -110,13 +120,17 @@ def main(n_epochs=1, seed=0, device="cpu"):
             # log
             writer.add_scalar("Loss/train", loss.item(), epoch * len(dl) + batch_idx)
             writer.add_scalars("times", times, epoch * len(dl) + batch_idx)
-            print(loss.item(), times)
-    writer.close()
+            # print(loss.item(), times, end="\r")
 
     # save model
-    torch.save(transformer_layer.state_dict(), os.path.join(writer.log_dir, "transformer_layer.pth"))
-    torch.save(linear_layer.state_dict(), os.path.join(writer.log_dir, "linear_layer.pth"))
-
+    torch.save(
+        transformer_layer.state_dict(),
+        os.path.join(writer.log_dir, "transformer_layer.pth"),
+    )
+    torch.save(
+        linear_layer.state_dict(), os.path.join(writer.log_dir, "linear_layer.pth")
+    )
+    writer.close()
 
 
 def visualize_sample(number):
