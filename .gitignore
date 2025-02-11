@@ -174,5 +174,7 @@ cython_debug/
 hftoken.py
 # data
 data/
+*.png
+*.jpeg
 # logs
 runs/
